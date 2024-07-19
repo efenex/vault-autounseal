@@ -337,9 +337,8 @@ if __name__ == "__main__":
                 ]
             )
         except socket.gaierror as err:
-            logger.error("Failed to lookup DNS info: {}", err)
-            sleep(5)
-            continue
+            logger.error("Failed to lookup DNS info, falling back to scanning for vault pods: {}", err)
+            vault_url = ""
 
     while True:
         if not vault_url or vault_url == "":     
