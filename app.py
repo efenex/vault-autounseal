@@ -283,8 +283,9 @@ if __name__ == "__main__":
         scan_delay = int(os.environ["VAULT_SCAN_DELAY"])
         pod_retrieval_max_retries = int(os.environ.get("VAULT_POD_RETRIEVAL_MAX_RETRIES", 5))
         vault_label_selector = os.environ.get("VAULT_LABEL_SELECTOR", "vault-sealed=true")
-        if not vault_url:
-            raise KeyError
+        if not vault_url or vault_url == "":
+            print("No Vault URL specified, relying on scan mechanism with label selector {}", vault_label_selector)
+            #raise KeyError
     except KeyError as error:
         if not secret_shares:
             secret_shares = 5
@@ -316,22 +317,14 @@ if __name__ == "__main__":
         "secret_threshold": int(secret_threshold),
     }
 
-    url = urlparse(vault_url)
-    vault_hostname = url.hostname
-    vault_port = url.port
-    vault_namespace = url.hostname.split(".")[1]
-    logger.info("Vault Hostname: {} Vault Port: {}", vault_hostname, vault_port)
 
-    while True:
-        logger.info("Begin scan cycle")
-        # When running multiple vault instances, the DNS query will return multiple IPs.
-        # We want to iterate over each of those IPs to ensure each replica is unsealed.
-
-        # getaddrinfo() returns a 5-touple of (family, type, proto, canonname, sockaddr)
-        # Index 4 (sockaddr) is a touple of (ip_addr, port), so we're extracting
-        # index 4 (the ip addr touple) and then indexing into that touple to get the
-        # actual ip address (index 0) and the port (index 1).
-
+    if vault_url and vault_url != "":     
+        url = urlparse(vault_url)
+        vault_hostname = url.hostname
+        vault_port = url.port
+        vault_namespace = url.hostname.split(".")[1]
+        logger.info("Vault Hostname: {} Vault Port: {}", vault_hostname, vault_port)
+        
         # Then use list comprehension to return a list of "http://{ip_addr}:{port}" to
         # iterate over
         try:
@@ -347,11 +340,25 @@ if __name__ == "__main__":
             logger.error("Failed to lookup DNS info: {}", err)
             sleep(5)
             continue
-        vault_replicas.clear()
 
-        pods = get_vault_pods()
-        for pod in pods.items:
-            vault_replicas.append(f"{url.scheme}://{pod.status.pod_ip}:{vault_port}")
+    while True:
+        if not vault_url or vault_url == "":     
+            logger.info("Begin scan cycle")
+            # When running multiple vault instances, the DNS query will return multiple IPs.
+            # We want to iterate over each of those IPs to ensure each replica is unsealed.
+    
+            # getaddrinfo() returns a 5-touple of (family, type, proto, canonname, sockaddr)
+            # Index 4 (sockaddr) is a touple of (ip_addr, port), so we're extracting
+        
+            # index 4 (the ip addr touple) and then indexing into that touple to get the
+            # actual ip address (index 0) and the port (index 1).
+
+            vault_replicas.clear()
+
+            pods = get_vault_pods()
+            for pod in pods.items:
+                vault_replicas.append(f"{url.scheme}://{pod.status.pod_ip}:{vault_port}")
+                
         logger.info("Discovered Vault instance(s): {}", vault_replicas)
         for replica_url in vault_replicas:
             status = get_seal_status(replica_url, vault_initialized)
