@@ -58,15 +58,18 @@ jobs:
           # image running in production was built by hand and its source was
           # never committed anywhere.
           images: efenex/vault-autounseal
-          # Without this, metadata-action falls back to type=ref,event=tag and
-          # publishes the git tag verbatim -- 0.5.3 shipped as the doubly
-          # prefixed :vault-autounseal-0.5.3. The semver defaults never fired
-          # because the prefixed tag does not parse as semver. Stripping the
-          # prefix makes releases publish :0.5.3 and :0.5, while branch and PR
-          # builds keep their readable ref names.
+          # The git tags here are prefixed (vault-autounseal-X.Y.Z), which does
+          # not parse as semver -- so type=semver never fires on them and the
+          # fallback type=ref,event=tag published the tag verbatim, which is how
+          # 0.5.3 shipped as :vault-autounseal-0.5.3.
+          #
+          # type=match is the prefix-STRIPPING mechanism: it regexes the git tag
+          # and emits a capture group. (prefix= does the opposite -- it prepends
+          # to the generated tag -- so using it here would have re-added the very
+          # prefix we are removing.)
           tags: |
-            type=semver,pattern={{version}},prefix=vault-autounseal-,value=${{ github.ref_name }},enable=${{ startsWith(github.ref, 'refs/tags/vault-autounseal-') }}
-            type=semver,pattern={{major}}.{{minor}},prefix=vault-autounseal-,value=${{ github.ref_name }},enable=${{ startsWith(github.ref, 'refs/tags/vault-autounseal-') }}
+            type=match,pattern=vault-autounseal-(\d+\.\d+\.\d+),group=1
+            type=match,pattern=vault-autounseal-(\d+\.\d+),group=1
             type=ref,event=branch
             type=ref,event=pr
 
