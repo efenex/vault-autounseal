@@ -18,6 +18,10 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Never block the scan loop forever on a wedged socket. A hung request is the
+# silent twin of a crash: the unsealer looks alive but stops unsealing.
+HTTP_TIMEOUT = float(os.environ.get("VAULT_HTTP_TIMEOUT", 10))
+
 
 def get_kubernetes_client():
     try:
@@ -42,29 +46,76 @@ def tracing_formatter(record):
     return "{level} | {extra[timestamp]} {extra[stack]} - {message}\n{exception}"
 
 
+def request_json(method, url, payload=None):
+    """Perform an HTTP request and decode the JSON body, or return None.
+
+    Every remote failure mode collapses to None so callers never have to reason
+    about partial results:
+      - transport failures (ConnectionError, ReadTimeout, TLS errors)
+      - non-2xx responses
+      - 2xx responses whose body is not JSON
+
+    That last case is the one that used to kill this process: when an ingress
+    or proxy sits in front of Vault it answers an outage with an HTML error
+    page, and an unguarded .json() raises JSONDecodeError out of the main loop.
+    """
+    try:
+        response = requests.request(
+            method,
+            url,
+            data=json.dumps(payload) if payload is not None else None,
+            timeout=HTTP_TIMEOUT,
+            verify=False,  # nosec
+        )
+    except requests.exceptions.RequestException as request_error:
+        logger.warning("{} {} failed: {}", method, url, request_error)
+        return None
+
+    if not response.ok:
+        logger.warning(
+            "{} {} returned HTTP {} ({} bytes, content-type {})",
+            method,
+            url,
+            response.status_code,
+            len(response.content),
+            response.headers.get("Content-Type", "unknown"),
+        )
+        return None
+
+    try:
+        return response.json()
+    except ValueError:
+        logger.warning(
+            "{} {} returned HTTP {} with a non-JSON body (content-type {}): {!r}",
+            method,
+            url,
+            response.status_code,
+            response.headers.get("Content-Type", "unknown"),
+            response.text[:200],
+        )
+        return None
+
+
 def list_convert(lst):
     converted_dict = {i: lst[i] for i in range(0, len(lst))}
     return converted_dict
 
 
 def init_vault(vault_instance_url):
-    try:
-        logger.info(f"Initializing Vault at {vault_instance_url}")
-        init_vault_request = requests.put(
-            f"{vault_instance_url}/v1/sys/init",
-            data=json.dumps(auto_unseal_payload),
-            verify=False,  # nosec
-        )
-        response = init_vault_request.json()
-        return response
-    except requests.exceptions.ConnectionError as init_vault_error:
-        logger.info(
-            "Got ConnectionError for  {}. Please check Vault api url/port",
-            init_vault_error,
-        )
+    logger.info(f"Initializing Vault at {vault_instance_url}")
+    return request_json(
+        "PUT", f"{vault_instance_url}/v1/sys/init", payload=auto_unseal_payload
+    )
 
 
 def create_secrets(secret):
+    if not secret or "root_token" not in secret or "keys" not in secret:
+        logger.error(
+            "Vault init returned no usable key material ({}); not writing secrets",
+            secret,
+        )
+        return False
+
     k8s_secret.metadata = client.V1ObjectMeta(name=root_token)
     k8s_secret.type = "Opaque"
     k8s_secret.string_data = {"root_token": secret["root_token"]}
@@ -81,12 +132,18 @@ def create_secrets(secret):
     except kubernetes.client.exceptions.ApiException as create_secret_error:
         logger.error("Error during creation on Vault secret {}", create_secret_error)
 
+    return True
+
 
 def read_secret(name, vault_instance_url):
-    secret_client = api_instance.read_namespaced_secret(
-        name=name, namespace=namespace
-    ).data
-    for secret in secret_client.values():
+    try:
+        secret_client = api_instance.read_namespaced_secret(
+            name=name, namespace=namespace
+        ).data
+    except kubernetes.client.exceptions.ApiException as read_secret_error:
+        logger.error("Could not read secret {}: {}", name, read_secret_error)
+        return
+    for secret in (secret_client or {}).values():
         key = base64.b64decode(secret)
         vault_unseal(key.decode(), vault_instance_url)
 
@@ -98,54 +155,53 @@ def get_secret(name):
 
 
 def vault_unseal(key, vault_instance_url):
-    payload = {"key": key}
-    try:
-        requests.put(
-            f"{vault_instance_url}/v1/sys/unseal",
-            data=json.dumps(payload),
-            verify=False,  # nosec
-        )
-    except requests.exceptions.ConnectionError as unseal_error:
-        logger.error("During unseal got error", unseal_error)
     if key is None:
         logger.info("Unseal key not found")
-    else:
-        logger.info("{} has been provided an unseal key", vault_instance_url)
+        return
+    # A rejected key is not fatal: with secret_shares > threshold some of the
+    # stored keys legitimately belong to a different quorum set.
+    request_json("PUT", f"{vault_instance_url}/v1/sys/unseal", payload={"key": key})
+    logger.info("{} has been provided an unseal key", vault_instance_url)
 
 
 def get_seal_status(vault_instance_url, vault_status):
-    try:
-        get_seal = requests.get(
-            f"{vault_instance_url}/v1/sys/seal-status", verify=False  # nosec
+    seal_status = request_json(
+        "GET", f"{vault_instance_url}/v1/sys/seal-status"
+    )
+    if seal_status is None or "initialized" not in seal_status:
+        # Unreachable or unintelligible. Report an error and let the next scan
+        # cycle retry -- do NOT propagate, or a transient proxy hiccup takes
+        # the unsealer down exactly when Vault needs it.
+        logger.warning(
+            "No usable seal status from {}; will retry next cycle", vault_instance_url
         )
-        if not get_seal.json()["initialized"]:
-            if vault_status:
-                logger.info(
-                    "Vault has already been initialized, establishing quorum instead"
-                )
-                return status_init  # Return status_init to establish quorum
-
-            logger.info("Going to init and unseal Vault")
-            try:
-                delete_secret([root_token, vault_keys])
-            except kubernetes.client.exceptions.ApiException as delete_secret_error:
-                logger.error(
-                    "During  initialize got a error -> {}", delete_secret_error
-                )
-            create_secrets(init_vault(vault_instance_url))
-
-            logger.info("Unsealing Vault node {}", replica_url)
-            read_secret(vault_keys, vault_instance_url)
-
-            return status_init
-        if get_seal.json()["sealed"]:
-            logger.info("Unsealing Vault node {}", replica_url)
-            read_secret(vault_keys, vault_instance_url)
-
-            return status_unseal
-    except requests.exceptions.ConnectionError as seal_status_error:
-        logger.info("Unexpected status -> {}", seal_status_error)
         return status_error
+
+    if not seal_status["initialized"]:
+        if vault_status:
+            logger.info(
+                "Vault has already been initialized, establishing quorum instead"
+            )
+            return status_init  # Return status_init to establish quorum
+
+        logger.info("Going to init and unseal Vault")
+        try:
+            delete_secret([root_token, vault_keys])
+        except kubernetes.client.exceptions.ApiException as delete_secret_error:
+            logger.error("During  initialize got a error -> {}", delete_secret_error)
+        if not create_secrets(init_vault(vault_instance_url)):
+            return status_error
+
+        logger.info("Unsealing Vault node {}", vault_instance_url)
+        read_secret(vault_keys, vault_instance_url)
+
+        return status_init
+
+    if seal_status.get("sealed"):
+        logger.info("Unsealing Vault node {}", vault_instance_url)
+        read_secret(vault_keys, vault_instance_url)
+
+        return status_unseal
 
     return status_ok
 
@@ -165,17 +221,17 @@ def get_quorum_established(quorum_established, replica_list, main_url):
             if vault_instance_url == main_url:
                 continue
 
-            leader_status = requests.get(
-                f"{vault_instance_url}/v1/sys/leader", verify=False  # nosec
+            leader_status = request_json(
+                "GET", f"{vault_instance_url}/v1/sys/leader"
             )
 
-            if "leader_address" not in leader_status.json():
+            if leader_status is None or "leader_address" not in leader_status:
                 quorum_established = False
                 logger.info(
-                    "Vault node {} is not ready: {} ", replica_url, leader_status.json()
+                    "Vault node {} is not ready: {}", vault_instance_url, leader_status
                 )
                 continue
-            if leader_status.json()["leader_address"] == main_url:
+            if leader_status["leader_address"] == main_url:
                 logger.info(
                     "Vault node {} has acknowledged {} as the leader",
                     vault_instance_url,
@@ -191,40 +247,37 @@ def get_quorum_established(quorum_established, replica_list, main_url):
                 quorum_established = False
                 break
 
-        sleep(5)
+        sleep(scan_delay)
 
 
 def wait_for_quorum(replica_list, main_url):
     payload = {"leader_api_addr": main_url}
-    leader_status = requests.get(f"{main_url}/v1/sys/leader", verify=False)  # nosec
-    logger.info(
-        "Leader http code {}, response json {}",
-        leader_status.status_code,
-        leader_status.json(),
-    )
+    leader_status = request_json("GET", f"{main_url}/v1/sys/leader")
+    logger.info("Leader response json {}", leader_status)
     for vault_instance_url in replica_list:
         if vault_instance_url == main_url:
             continue
-        try:
-            logger.info("Joining {} to leader", vault_instance_url)
 
-            requests.post(
+        logger.info("Joining {} to leader", vault_instance_url)
+        if (
+            request_json(
+                "POST",
                 f"{vault_instance_url}/v1/sys/storage/raft/join",
-                data=json.dumps(payload),
-                verify=False,  # nosec
+                payload=payload,
             )
-
-        except requests.exceptions.ConnectionError as connection_error:
-            logger.info("Unexpected error {}", connection_error)
+            is None
+        ):
+            logger.warning(
+                "Raft join of {} failed; will retry on the next cycle",
+                vault_instance_url,
+            )
             return status_error
 
-        logger.info("Unsealing {}", replica_url)
+        logger.info("Unsealing {}", vault_instance_url)
         read_secret(vault_keys, vault_instance_url)
 
-    quorum_established = False
-
     get_quorum_established(
-        quorum_established=quorum_established,
+        quorum_established=False,
         replica_list=replica_list,
         main_url=main_url,
     )
@@ -240,13 +293,25 @@ def get_vault_pods():
     tries = 0
     while tries < pod_retrieval_max_retries:
         tries = tries + 1
-        pod_list = api_instance.list_namespaced_pod(
-            namespace=vault_namespace, label_selector=vault_label_selector
-        )
+        try:
+            pod_list = api_instance.list_namespaced_pod(
+                namespace=vault_namespace, label_selector=vault_label_selector
+            )
+        except kubernetes.client.exceptions.ApiException as list_pods_error:
+            logger.warning("Listing Vault pods failed: {}", list_pods_error)
+            sleep(scan_delay)
+            continue
 
         if len(pod_list.items) == 0:
-            logger.error("Not Vault pods found. Please make sure they are annotated with: {}", vault_label_selector)
-            exit(2)
+            # Not fatal: the selector may transiently match nothing while pods
+            # reschedule. Retry rather than exiting into CrashLoopBackOff.
+            logger.warning(
+                "No Vault pods matched selector {} in namespace {}",
+                vault_label_selector,
+                vault_namespace,
+            )
+            sleep(scan_delay)
+            continue
 
         vault_pods_with_no_ip = [pod.metadata.name for pod in pod_list.items if pod.status.pod_ip is None]
 
@@ -257,8 +322,8 @@ def get_vault_pods():
 
         return pod_list
 
-    logger.error("Waiting for Vault pods to be ready timed out. Will exit.")
-    exit(2)
+    logger.warning("Waiting for Vault pods to be ready timed out; retrying next cycle.")
+    return None
 
 
 if __name__ == "__main__":
@@ -302,6 +367,22 @@ if __name__ == "__main__":
         else:
             print("Please check system variable {}", error)
             exit(2)
+
+    # Scan mode built these from `url.scheme` and `vault_port`. Upstream
+    # derived them by urlparse()ing VAULT_URL, which cannot work once VAULT_URL
+    # holds several endpoints, and derived the namespace as
+    # `url.hostname.split(".")[1]` -- that yields "rootlease" for
+    # vault.rootlease.be and IndexErrors outright on a dotless hostname. Read
+    # them from the environment instead, defaulting to Vault's own defaults.
+    vault_namespace = os.environ.get("VAULT_NAMESPACE", namespace)
+    vault_scheme = os.environ.get("VAULT_SCHEME", "http")
+    vault_port = int(os.environ.get("VAULT_PORT", 8200))
+    # Opt-in: expand a single VAULT_URL to one endpoint per resolved address.
+    # Off by default because it is the strictly weaker way to reach a
+    # StatefulSet -- resolved IPs are correct only until the next reschedule,
+    # whereas per-pod DNS names survive one.
+    resolve_dns = os.environ.get("VAULT_RESOLVE_DNS", "").lower() in ("1", "true", "yes")
+
     logger.remove()
     logger.add(sys.stderr, format=tracing_formatter)
     logger.info("Start Vault auto unseal")
@@ -317,69 +398,99 @@ if __name__ == "__main__":
         "secret_threshold": int(secret_threshold),
     }
 
+    # Endpoints are recomputed on EVERY scan cycle (see below). Upstream
+    # resolved them once, before the loop: after a pod reschedule -- a spot
+    # preemption, a rollout -- the cached IPs pointed at pods that no longer
+    # existed, and the unsealer kept talking to nothing for the rest of its
+    # lifetime. Vault would sit sealed with a healthy-looking unsealer.
+    def resolve_replicas():
+        """Return the Vault endpoints to unseal, freshly resolved."""
+        if vault_url:
+            # Whitespace-separated, so a StatefulSet can be addressed by its
+            # stable per-pod DNS names. That is deterministic where resolving
+            # one Service name is not: in HA, EVERY replica boots sealed and
+            # must be unsealed individually, and a Service hands back one pod
+            # per lookup.
+            entries = vault_url.split()
+            if resolve_dns and len(entries) == 1:
+                expanded = _expand_dns(entries[0])
+                if expanded:
+                    return expanded
+            return entries
 
-    if vault_url and vault_url != "":     
-        url = urlparse(vault_url)
-        vault_hostname = url.hostname
-        vault_port = url.port
-        vault_namespace = url.hostname.split(".")[1]
-        logger.info("Vault Hostname: {} Vault Port: {}", vault_hostname, vault_port)
-        
-        # Then use list comprehension to return a list of "http://{ip_addr}:{port}" to
-        # iterate over
+        pods = get_vault_pods()
+        if pods is None:
+            return []
+        return [
+            f"{vault_scheme}://{pod.status.pod_ip}:{vault_port}"
+            for pod in pods.items
+        ]
+
+    def _expand_dns(endpoint):
+        """Expand one URL into per-address URLs, or [] if it will not resolve."""
         try:
-            vault_replicas = sorted(
-                [
-                    f"{url.scheme}://{x[4][0]}:{x[4][1]}"
-                    for x in socket.getaddrinfo(
-                    vault_hostname, vault_port, proto=socket.IPPROTO_TCP
+            parsed = urlparse(endpoint)
+            port = parsed.port or vault_port
+            return sorted(
+                f"{parsed.scheme}://{info[4][0]}:{info[4][1]}"
+                for info in socket.getaddrinfo(
+                    parsed.hostname, port, proto=socket.IPPROTO_TCP
                 )
-                ]
             )
-        except socket.gaierror as err:
-            logger.error("Failed to lookup DNS info, falling back to scanning for vault pods: {}", err)
-            vault_url = ""
+        except (socket.gaierror, ValueError) as resolve_error:
+            logger.warning(
+                "Could not resolve {}: {}; using it verbatim",
+                endpoint,
+                resolve_error,
+            )
+            return []
 
+    previous_replicas = None
     while True:
-        if not vault_url or vault_url == "":     
-            logger.info("Begin scan cycle")
-            # When running multiple vault instances, the DNS query will return multiple IPs.
-            # We want to iterate over each of those IPs to ensure each replica is unsealed.
-    
-            # getaddrinfo() returns a 5-touple of (family, type, proto, canonname, sockaddr)
-            # Index 4 (sockaddr) is a touple of (ip_addr, port), so we're extracting
-        
-            # index 4 (the ip addr touple) and then indexing into that touple to get the
-            # actual ip address (index 0) and the port (index 1).
+        # This daemon must outlive every transient fault it can encounter.
+        # While it is restarting it is not unsealing, and CrashLoopBackOff
+        # makes each successive failure cost more downtime than the last --
+        # so the process that exists to recover Vault is asleep for longest
+        # exactly when Vault has been down longest.
+        try:
+            vault_replicas = resolve_replicas()
+            if not vault_replicas:
+                logger.warning("No Vault endpoints resolved; retrying next cycle")
+                sleep(scan_delay)
+                continue
 
-            vault_replicas.clear()
+            # Logged on change only. At the default 5s scan delay this line
+            # was 17k identical INFO records a day, which is how a real
+            # transition gets lost.
+            if vault_replicas != previous_replicas:
+                logger.info("Vault instance(s): {}", vault_replicas)
+                previous_replicas = vault_replicas
 
-            pods = get_vault_pods()
-            for pod in pods.items:
-                vault_replicas.append(f"{url.scheme}://{pod.status.pod_ip}:{vault_port}")
-                
-        logger.info("Discovered Vault instance(s): {}", vault_replicas)
-        for replica_url in vault_replicas:
-            status = get_seal_status(replica_url, vault_initialized)
-            if status == status_init:
-                if len(vault_replicas) > 1:
+            for replica_url in vault_replicas:
+                logger.debug("Checking seal status for: {}", replica_url)
+                status = get_seal_status(replica_url, vault_initialized)
+                if status == status_init:
+                    if len(vault_replicas) > 1:
+                        logger.info(
+                            "Vault running in High Availability mode will unseal Vault nodes one by one"
+                        )
+                    else:
+                        logger.info("Vault running in Single Node mode will unseal")
+
+                    # Only set the Leader URL once
+                    if not vault_initialized:
+                        vault_initialized = True
+                        leader_url = replica_url
                     logger.info(
-                        "Vault running in High Availability mode will unseal Vault nodes one by one"
+                        "Vault was just initialized, waiting for quorum to be established"
                     )
-                else:
-                    logger.info("Vault running in Singe Node mode will unseal")
-                # Only set the Leader URL once
-                if not vault_initialized:
-                    vault_initialized = True
-                    leader_url = replica_url
-                logger.info(
-                    "Vault was just initialized, waiting for quorum to be established"
-                )
-                wait_for_quorum(vault_replicas, leader_url)
+                    wait_for_quorum(vault_replicas, leader_url)
 
-            if status == status_unseal:
-                # If we've unsealed an instance, then by definition vault has been initialized
-                vault_initialized = True
-                logger.info("Vault has been unsealed")
+                if status == status_unseal:
+                    # If we've unsealed an instance, then by definition vault has been initialized
+                    vault_initialized = True
+                    logger.info("Vault has been unsealed")
+        except Exception:  # noqa: BLE001 -- deliberate: staying up beats being right
+            logger.exception("Unhandled error in scan cycle; continuing")
 
         sleep(scan_delay)
