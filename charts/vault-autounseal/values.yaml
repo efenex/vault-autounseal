@@ -66,6 +66,9 @@ settings:
   vault_keys_secret: vault-keys
   # time between polling for vault status, in seconds
   scan_delay: 5
+  # vault label used to retrieve the vault instance (scan mode only, i.e.
+  # when vault_url is unset)
+  vault_label_selector: app.kubernetes.io/instance=vault,component=server
 
 # Extra volumes and mounts, e.g. a client certificate for mutual TLS.
 # Pair these with settings.vault_client_cert / vault_client_key.
