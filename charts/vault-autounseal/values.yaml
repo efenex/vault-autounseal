@@ -25,8 +25,23 @@ serviceAccount:
 
 podAnnotations: {}
 
-podSecurityContext: {}
-  # fsGroup: 2000
+# fsGroup is a DEFAULT HERE ON PURPOSE, and removing it will break mutual TLS.
+#
+# The image is gcr.io/distroless/python3-debian12:nonroot, so the process runs
+# as uid/gid 65532. Kubernetes writes secret- and configMap-volume files owned
+# root:root, and applies fsGroup as the GROUP owner. Without an fsGroup, a
+# mounted client-certificate key is root-owned and the only process that needs
+# it cannot open it.
+#
+# That failure is genuinely hard to read: Python raises the EACCES from inside
+# the TLS handshake, so requests reports
+#   ('Connection aborted.', PermissionError(13, 'Permission denied'))
+# which looks like a network fault, on a pod that is happily Running 1/1.
+# Observed in production 2026-08-26 against vault-{0,1,2}.radiomics.bio.
+#
+# Keep this in sync with the base image's uid/gid if that ever changes.
+podSecurityContext:
+  fsGroup: 65532
 
 securityContext: {}
   # capabilities:
@@ -77,9 +92,18 @@ settings:
 #     - name: vault-client-tls
 #       secret:
 #         secretName: vault-autounseal-client-tls
+#         defaultMode: 0440
 #   extraVolumeMounts:
 #     - name: vault-client-tls
 #       mountPath: /tls
 #       readOnly: true
+#
+# NOTE ON defaultMode: use 0440, not 0400. 0400 is the instinctive choice for a
+# private key and it does not work here -- the file is owned root:root, this
+# container is not root, and owner-only permissions lock out the one process
+# that needs the key. 0440 grants read to the group, which podSecurityContext
+# .fsGroup above sets to the container's own gid. Both halves are required:
+# fsGroup with 0400 still yields owner-only, and 0440 without fsGroup leaves
+# the group as root.
 extraVolumes: []
 extraVolumeMounts: []
