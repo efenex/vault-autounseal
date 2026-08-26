@@ -23,6 +23,38 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 HTTP_TIMEOUT = float(os.environ.get("VAULT_HTTP_TIMEOUT", 10))
 
 
+def _client_cert():
+    """Return the requests `cert=` value for mutual TLS, or None.
+
+    Set VAULT_CLIENT_CERT (and optionally VAULT_CLIENT_KEY) when Vault sits
+    behind a proxy that authenticates callers by client certificate instead of
+    by source IP. A source-IP allowlist cannot work when this process egresses
+    through an address it does not control -- ephemeral node IPs, a NAT pool,
+    anything autoscaled -- and it fails CLOSED and SILENTLY: the proxy answers
+    403, every seal-status probe returns None, and the unsealer looks healthy
+    while unsealing nothing.
+
+    Both variables unset -> None -> unchanged behaviour.
+    A combined cert+key PEM is passed as VAULT_CLIENT_CERT alone.
+    """
+    cert = os.environ.get("VAULT_CLIENT_CERT")
+    if not cert:
+        return None
+    key = os.environ.get("VAULT_CLIENT_KEY")
+    return (cert, key) if key else cert
+
+
+def _verify():
+    """Return the requests `verify=` value.
+
+    Defaults to False to preserve this image's long-standing behaviour against
+    self-signed Vault listeners. Set VAULT_CA_BUNDLE to a CA file to actually
+    verify the server -- which you want whenever the endpoint is reachable off
+    the cluster.
+    """
+    return os.environ.get("VAULT_CA_BUNDLE") or False
+
+
 def get_kubernetes_client():
     try:
         config.load_incluster_config()
@@ -51,7 +83,8 @@ def request_json(method, url, payload=None):
 
     Every remote failure mode collapses to None so callers never have to reason
     about partial results:
-      - transport failures (ConnectionError, ReadTimeout, TLS errors)
+      - transport failures (ConnectionError, ReadTimeout, TLS errors), which
+        now include a client-certificate rejection when mutual TLS is enabled
       - non-2xx responses
       - 2xx responses whose body is not JSON
 
@@ -65,7 +98,8 @@ def request_json(method, url, payload=None):
             url,
             data=json.dumps(payload) if payload is not None else None,
             timeout=HTTP_TIMEOUT,
-            verify=False,  # nosec
+            cert=_client_cert(),
+            verify=_verify(),  # nosec
         )
     except requests.exceptions.RequestException as request_error:
         logger.warning("{} {} failed: {}", method, url, request_error)

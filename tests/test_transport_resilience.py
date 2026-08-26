@@ -1,11 +1,5 @@
 """Regression tests for the transport layer.
 
-These pin the failure that took Vault down on 2026-08-03: an ingress in front
-of Vault answered an outage with an HTML 503, ``get_seal_status`` called
-``.json()`` on it, and the resulting ``JSONDecodeError`` escaped the main loop.
-The process exited 1 and CrashLoopBackOff then held the unsealer down -- with a
-backoff that grew on every attempt -- while Vault sat sealed.
-
 The invariant these tests defend is narrow and absolute: **no remote behaviour
 may raise out of get_seal_status**. A wrong answer costs one scan cycle; an
 exception costs an exponentially growing outage.
@@ -153,3 +147,74 @@ def test_every_request_is_bounded_by_a_timeout(app):
     connection looks alive to Kubernetes while unsealing nothing.
     """
     assert app.HTTP_TIMEOUT > 0
+
+
+# --- mutual TLS -------------------------------------------------------------
+
+def _captured_request(app, monkeypatch):
+    """Call request_json against a stubbed requests.request; return the kwargs."""
+    seen = {}
+
+    class _Response:
+        ok = True
+        status_code = 200
+        content = b"{}"
+        headers = {"Content-Type": "application/json"}
+        text = "{}"
+
+        def json(self):
+            return {}
+
+    def _fake_request(method, url, **kwargs):
+        seen.update(kwargs)
+        return _Response()
+
+    monkeypatch.setattr(app.requests, "request", _fake_request)
+    app.request_json("GET", "https://vault-0.example/v1/sys/seal-status")
+    return seen
+
+
+def test_no_client_cert_by_default(app, monkeypatch):
+    """Unset -> unchanged behaviour: no cert, and verify stays off."""
+    monkeypatch.delenv("VAULT_CLIENT_CERT", raising=False)
+    monkeypatch.delenv("VAULT_CLIENT_KEY", raising=False)
+    monkeypatch.delenv("VAULT_CA_BUNDLE", raising=False)
+    seen = _captured_request(app, monkeypatch)
+    assert seen["cert"] is None
+    assert seen["verify"] is False
+
+
+def test_client_cert_and_key_reach_the_request(app, monkeypatch):
+    """A separate cert and key are passed as the (cert, key) pair requests wants."""
+    monkeypatch.setenv("VAULT_CLIENT_CERT", "/tls/tls.crt")
+    monkeypatch.setenv("VAULT_CLIENT_KEY", "/tls/tls.key")
+    monkeypatch.delenv("VAULT_CA_BUNDLE", raising=False)
+    assert _captured_request(app, monkeypatch)["cert"] == ("/tls/tls.crt", "/tls/tls.key")
+
+
+def test_combined_pem_is_passed_alone(app, monkeypatch):
+    """A single file holding both cert and key is passed as a bare path."""
+    monkeypatch.setenv("VAULT_CLIENT_CERT", "/tls/combined.pem")
+    monkeypatch.delenv("VAULT_CLIENT_KEY", raising=False)
+    assert _captured_request(app, monkeypatch)["cert"] == "/tls/combined.pem"
+
+
+def test_ca_bundle_enables_server_verification(app, monkeypatch):
+    """VAULT_CA_BUNDLE opts in to verifying the server, instead of verify=False."""
+    monkeypatch.delenv("VAULT_CLIENT_CERT", raising=False)
+    monkeypatch.setenv("VAULT_CA_BUNDLE", "/tls/ca.crt")
+    assert _captured_request(app, monkeypatch)["verify"] == "/tls/ca.crt"
+
+
+def test_a_rejected_client_cert_degrades_instead_of_raising(app, monkeypatch):
+    """An SSLError from a rejected cert must collapse to None like any transport error.
+
+    The whole point of the fix is reachability; it must not reintroduce the
+    crash-loop class the rest of this file defends against.
+    """
+    def _boom(method, url, **kwargs):
+        raise app.requests.exceptions.SSLError("tlsv13 alert certificate required")
+
+    monkeypatch.setenv("VAULT_CLIENT_CERT", "/tls/tls.crt")
+    monkeypatch.setattr(app.requests, "request", _boom)
+    assert app.request_json("GET", "https://vault-0.example/v1/sys/seal-status") is None

@@ -50,6 +50,22 @@ Run script `python app.py`
 | NAMESPACE               | Kubernetes namespace for storing vault root key and keys                                                                                        |
 | VAULT_ROOT_TOKEN_SECRET | Kubernetes secret name for root token                                                                                                           |
 | VAULT_KEYS_SECRET       | Kubernetes secret name for vault key                                                                                                            |
+| VAULT_CLIENT_CERT       | Optional. Path to a client certificate (PEM) to present for mutual TLS. Unset = no client certificate, i.e. unchanged behaviour.                 |
+| VAULT_CLIENT_KEY        | Optional. Path to the client private key. Omit when `VAULT_CLIENT_CERT` is a combined cert+key PEM.                                              |
+| VAULT_CA_BUNDLE         | Optional. Path to a CA bundle used to verify the Vault endpoint. Unset preserves this image's historical `verify=False`.                         |
+
+### Mutual TLS
+
+Set `VAULT_CLIENT_CERT` (and `VAULT_CLIENT_KEY`) when Vault sits behind a proxy
+that authenticates callers by **client certificate** rather than by source IP.
+
+Prefer this over a source-IP allowlist whenever the unsealer's egress address is
+not under your control -- ephemeral node IPs, a NAT pool, anything autoscaled.
+An allowlist in that situation fails **closed and silently**: the proxy answers
+`403`, every seal-status probe returns `None`, and the unsealer stays `Running`
+1/1 while unsealing nothing. That failure is invisible until the next time a
+Vault pod actually needs unsealing -- i.e. during an incident.
+
 
 ## Deployment
 
