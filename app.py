@@ -405,9 +405,9 @@ if __name__ == "__main__":
     # Scan mode built these from `url.scheme` and `vault_port`. Upstream
     # derived them by urlparse()ing VAULT_URL, which cannot work once VAULT_URL
     # holds several endpoints, and derived the namespace as
-    # `url.hostname.split(".")[1]` -- that yields "rootlease" for
-    # vault.rootlease.be and IndexErrors outright on a dotless hostname. Read
-    # them from the environment instead, defaulting to Vault's own defaults.
+    # `url.hostname.split(".")[1]` -- which yields an arbitrary middle label of
+    # the hostname, and IndexErrors outright on a dotless one. Read them from
+    # the environment instead, defaulting to Vault's own defaults.
     vault_namespace = os.environ.get("VAULT_NAMESPACE", namespace)
     vault_scheme = os.environ.get("VAULT_SCHEME", "http")
     vault_port = int(os.environ.get("VAULT_PORT", 8200))

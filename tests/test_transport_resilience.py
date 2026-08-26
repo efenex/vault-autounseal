@@ -94,7 +94,7 @@ def responder():
 @pytest.mark.parametrize(
     "status,ctype,body,label",
     [
-        (503, "text/html", NGINX_503, "nginx HTML 503 (the 2026-08-03 outage)"),
+        (503, "text/html", NGINX_503, "nginx HTML 503 (the original outage)"),
         (502, "text/html", b"<html>502 Bad Gateway</html>", "HTML 502"),
         (200, "application/json", b"", "empty body, 200"),
         (200, "application/json", b"{truncated", "truncated JSON"),
@@ -108,7 +108,7 @@ def test_non_json_never_raises(app, responder, status, ctype, body, label):
 
 
 def test_seal_status_degrades_on_html_error_page(app, responder):
-    """The exact 2026-08-03 call path returns status_error instead of raising."""
+    """The exact call path from the original outage returns status_error, not a raise."""
     responder.update(status=503, ctype="text/html", body=NGINX_503)
     assert app.get_seal_status(responder["url"], True) == app.status_error
 
